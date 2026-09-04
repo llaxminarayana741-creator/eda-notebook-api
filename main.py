@@ -5,16 +5,19 @@ import os
 import pandas as pd
 import numpy as np
 import nbformat
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
-from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
+from nbformat.v4 import new_notebook, new_markdown_cell
 
 # =========================
 # CONFIG
 # =========================
 API_KEY = os.getenv("API_KEY", "mysecretkey")
 
-app = FastAPI(title="EDA Notebook API", version="3.0.0")
+app = FastAPI(title="EDA Notebook API", version="4.0.0")
 
 
 # =========================
@@ -33,17 +36,17 @@ def verify_token(authorization: str = Header(None)):
 # DATA CLEANING
 # =========================
 def clean_data(df):
-    # remove duplicates
     df = df.drop_duplicates()
-
-    # handle missing values
     df = df.ffill().bfill()
 
-    # convert numeric columns
+    # Safe numeric conversion
     for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='ignore')
+        try:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        except:
+            pass
 
-    # remove outliers using IQR
+    # Remove outliers (IQR)
     numeric_cols = df.select_dtypes(include=np.number).columns
     for col in numeric_cols:
         Q1 = df[col].quantile(0.25)
@@ -55,54 +58,66 @@ def clean_data(df):
 
 
 # =========================
-# NOTEBOOK (NO EXECUTION)
+# NOTEBOOK WITH OUTPUTS
 # =========================
-def build_notebook(csv_text):
+def build_notebook(df):
     nb = new_notebook()
     cells = []
 
     cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
 
-    cells.append(new_code_cell(f"""
-import pandas as pd
-import numpy as np
-import io
-import matplotlib.pyplot as plt
-import seaborn as sns
+    # Preview Table
+    cells.append(new_markdown_cell("## Dataset Preview"))
+    cells.append(new_markdown_cell(df.head().to_html()))
 
-cleaned_csv = \"\"\"{csv_text}\"\"\"
-df = pd.read_csv(io.StringIO(cleaned_csv))
-
-df.head()
-"""))
-
+    # Info
+    buffer = io.StringIO()
+    df.info(buf=buffer)
     cells.append(new_markdown_cell("## Dataset Info"))
-    cells.append(new_code_cell("df.info()"))
+    cells.append(new_markdown_cell(f"```\n{buffer.getvalue()}\n```"))
 
+    # Describe
     cells.append(new_markdown_cell("## Summary Statistics"))
-    cells.append(new_code_cell("df.describe(include='all')"))
+    cells.append(new_markdown_cell(df.describe(include='all').to_html()))
 
+    # Missing values
     cells.append(new_markdown_cell("## Missing Values"))
-    cells.append(new_code_cell("df.isnull().sum()"))
+    cells.append(new_markdown_cell(df.isnull().sum().to_frame().to_html()))
+
+    # Histogram
+    plt.figure(figsize=(10,6))
+    df.hist(figsize=(12,8))
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    img = base64.b64encode(buf.getvalue()).decode()
+
+    cells.append(new_markdown_cell("## Distribution Plots"))
+    cells.append(new_markdown_cell(f"![Histogram](data:image/png;base64,{img})"))
+
+    # Boxplot
+    plt.figure(figsize=(10,6))
+    df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    img = base64.b64encode(buf.getvalue()).decode()
+
+    cells.append(new_markdown_cell("## Boxplots"))
+    cells.append(new_markdown_cell(f"![Boxplot](data:image/png;base64,{img})"))
+
+    # Correlation heatmap
+    plt.figure(figsize=(10,6))
+    sns.heatmap(df.corr(numeric_only=True), annot=True, cmap='coolwarm')
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    img = base64.b64encode(buf.getvalue()).decode()
 
     cells.append(new_markdown_cell("## Correlation Heatmap"))
-    cells.append(new_code_cell("""
-plt.figure(figsize=(10,6))
-sns.heatmap(df.corr(numeric_only=True), annot=True, cmap='coolwarm')
-plt.show()
-"""))
-
-    cells.append(new_markdown_cell("## Distribution"))
-    cells.append(new_code_cell("""
-df.hist(figsize=(12,8))
-plt.show()
-"""))
-
-    cells.append(new_markdown_cell("## Outliers"))
-    cells.append(new_code_cell("""
-df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
-plt.show()
-"""))
+    cells.append(new_markdown_cell(f"![Heatmap](data:image/png;base64,{img})"))
 
     nb["cells"] = cells
     return nbformat.writes(nb)
@@ -116,7 +131,7 @@ def home():
     return {
         "status": "ok",
         "service": "EDA Notebook API",
-        "version": "3.0.0"
+        "version": "4.0.0"
     }
 
 
@@ -127,19 +142,26 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
         raise HTTPException(status_code=400, detail="Upload CSV only")
 
     content = await file.read()
-    df = pd.read_csv(io.BytesIO(content))
 
-    # clean
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV read error: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="CSV is empty")
+
+    # Clean data
     df = clean_data(df)
 
-    # convert to csv
+    # CSV output
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     csv_text = csv_buffer.getvalue()
     csv_b64 = base64.b64encode(csv_text.encode()).decode()
 
-    # notebook
-    notebook_json = build_notebook(csv_text)
+    # Notebook output
+    notebook_json = build_notebook(df)
     notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
     return JSONResponse({
