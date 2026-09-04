@@ -9,12 +9,15 @@ from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
 
+# NEW: for executing notebook
+from nbconvert.preprocessors import ExecutePreprocessor
+
 # =========================
 # CONFIG
 # =========================
 API_KEY = os.getenv("API_KEY", "mysecretkey")
 
-app = FastAPI()
+app = FastAPI(title="EDA Notebook API", version="2.0.0")
 
 
 # =========================
@@ -30,25 +33,21 @@ def verify_token(authorization: str = Header(None)):
 
 
 # =========================
-# DATA CLEANING (ADVANCED)
+# DATA CLEANING
 # =========================
 def clean_data(df):
-    # Remove duplicates
     df = df.drop_duplicates()
 
-    # Handle missing values
+    # handle missing values
     df = df.ffill().bfill()
 
-    # Convert numeric columns properly
+    # convert numeric safely
     for col in df.columns:
-        try:
-            df[col] = pd.to_numeric(df[col])
-        except:
-            pass
+        df[col] = pd.to_numeric(df[col], errors='ignore')
 
-    # Remove outliers using IQR (for numeric columns)
-    numeric_cols = df.select_dtypes(include=np.number).columns
-    for col in numeric_cols:
+    # remove outliers (IQR)
+    num_cols = df.select_dtypes(include=np.number).columns
+    for col in num_cols:
         Q1 = df[col].quantile(0.25)
         Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
@@ -60,11 +59,12 @@ def clean_data(df):
 # =========================
 # NOTEBOOK GENERATION
 # =========================
-def build_notebook(cleaned_csv):
+def build_notebook(csv_text):
     nb = new_notebook()
+
     cells = []
 
-    cells.append(new_markdown_cell("# 📊 Advanced EDA Report"))
+    cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
 
     cells.append(new_code_cell(f"""
 import pandas as pd
@@ -73,8 +73,8 @@ import io
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-data = \"\"\"{cleaned_csv}\"\"\"
-df = pd.read_csv(io.StringIO(data))
+cleaned_csv = \"\"\"{csv_text}\"\"\"
+df = pd.read_csv(io.StringIO(cleaned_csv))
 
 df.head()
 """))
@@ -82,7 +82,7 @@ df.head()
     cells.append(new_markdown_cell("## Dataset Info"))
     cells.append(new_code_cell("df.info()"))
 
-    cells.append(new_markdown_cell("## Statistical Summary"))
+    cells.append(new_markdown_cell("## Summary Statistics"))
     cells.append(new_code_cell("df.describe(include='all')"))
 
     cells.append(new_markdown_cell("## Missing Values"))
@@ -101,14 +101,23 @@ df.hist(figsize=(12,8))
 plt.show()
 """))
 
-    cells.append(new_markdown_cell("## Boxplot (Outliers)"))
+    cells.append(new_markdown_cell("## Outliers (Boxplot)"))
     cells.append(new_code_cell("""
 df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
 plt.show()
 """))
 
-    nb["cells"] = cells
-    return nbformat.writes(nb)
+    nb['cells'] = cells
+    return nb
+
+
+# =========================
+# EXECUTE NOTEBOOK
+# =========================
+def execute_notebook(nb):
+    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
+    ep.preprocess(nb, {})
+    return nb
 
 
 # =========================
@@ -116,29 +125,35 @@ plt.show()
 # =========================
 @app.get("/")
 def home():
-    return {"status": "API running"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/run")
 async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
+
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Upload CSV only")
 
     content = await file.read()
     df = pd.read_csv(io.BytesIO(content))
 
-    # Clean data
+    # clean data
     df = clean_data(df)
 
-    # Convert cleaned CSV
+    # CSV to base64
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     csv_text = csv_buffer.getvalue()
     csv_b64 = base64.b64encode(csv_text.encode()).decode()
 
-    # Notebook
-    notebook = build_notebook(csv_text)
-    notebook_b64 = base64.b64encode(notebook.encode()).decode()
+    # notebook
+    nb = build_notebook(csv_text)
+
+    # EXECUTE notebook (IMPORTANT)
+    nb = execute_notebook(nb)
+
+    notebook_json = nbformat.writes(nb)
+    notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
     return JSONResponse({
         "csv_file": csv_b64,
