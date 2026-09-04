@@ -15,7 +15,8 @@ from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
 # =========================
 API_KEY = os.getenv("API_KEY", "mysecretkey")
 
-app = FastAPI(title="EDA Notebook API", version="5.0.0")
+app = FastAPI(title="EDA Notebook API", version="FINAL-1.0.0")
+
 
 # =========================
 # AUTH
@@ -32,34 +33,36 @@ def verify_token(authorization: str = Header(None)):
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 # =========================
-# SAFE DATA CLEANING
+# CLEAN DATA (SAFE)
 # =========================
 def clean_data(df):
-    before_rows = len(df)
+    before = len(df)
 
     # remove duplicates
     df = df.drop_duplicates()
 
-    # handle missing values safely
+    # fill missing
     df = df.ffill().bfill()
 
-    # convert numeric safely (FIXED)
+    # safe numeric conversion
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         except:
             pass
 
-    # fill NaN created by coercion
+    # fill remaining NaN
     df = df.fillna(0)
 
-    after_rows = len(df)
+    after = len(df)
 
-    return df, before_rows, after_rows
+    return df, before, after
+
 
 # =========================
-# NOTEBOOK CREATION
+# NOTEBOOK BUILDER
 # =========================
 def build_notebook():
     nb = new_notebook()
@@ -74,7 +77,7 @@ import seaborn as sns
 
 df = pd.read_csv("cleaned_data.csv")
 
-print("Shape:", df.shape)
+print("Dataset Shape:", df.shape)
 
 display(df.head())
 """))
@@ -110,6 +113,7 @@ plt.show()
     nb["cells"] = cells
     return nbformat.writes(nb)
 
+
 # =========================
 # ROUTES
 # =========================
@@ -118,19 +122,21 @@ def home():
     return {
         "status": "ok",
         "service": "EDA Notebook API",
-        "version": "5.0.0"
+        "version": "FINAL-1.0.0"
     }
+
 
 @app.post("/run")
 async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
 
     try:
+        # Validate file
         if not file.filename.endswith(".csv"):
             raise HTTPException(status_code=400, detail="Upload CSV only")
 
         content = await file.read()
 
-        # SAFE CSV LOAD (FIXED)
+        # SAFE CSV READ
         try:
             df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
         except:
@@ -139,7 +145,7 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
         if df.empty:
             raise HTTPException(status_code=400, detail="CSV is empty")
 
-        # CLEAN
+        # CLEAN DATA
         df, before, after = clean_data(df)
 
         if df.empty:
@@ -149,17 +155,19 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False)
         csv_text = csv_buffer.getvalue()
+
         csv_b64 = base64.b64encode(csv_text.encode()).decode()
 
-        # NOTEBOOK
+        # CREATE NOTEBOOK
         notebook_json = build_notebook()
         notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
+        # ✅ FINAL RESPONSE (MATCHES N8N)
         return JSONResponse({
             "rows_before": before,
             "rows_after": after,
-            "cleaned_csv": csv_b64,
-            "notebook_file": notebook_b64
+            "csv_file": csv_b64,          # ✅ IMPORTANT KEY
+            "notebook_file": notebook_b64 # ✅ IMPORTANT KEY
         })
 
     except Exception as e:
