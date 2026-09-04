@@ -9,15 +9,12 @@ from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
 
-# NEW: for executing notebook
-from nbconvert.preprocessors import ExecutePreprocessor
-
 # =========================
 # CONFIG
 # =========================
 API_KEY = os.getenv("API_KEY", "mysecretkey")
 
-app = FastAPI(title="EDA Notebook API", version="2.0.0")
+app = FastAPI(title="EDA Notebook API", version="3.0.0")
 
 
 # =========================
@@ -36,18 +33,19 @@ def verify_token(authorization: str = Header(None)):
 # DATA CLEANING
 # =========================
 def clean_data(df):
+    # remove duplicates
     df = df.drop_duplicates()
 
     # handle missing values
     df = df.ffill().bfill()
 
-    # convert numeric safely
+    # convert numeric columns
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='ignore')
 
-    # remove outliers (IQR)
-    num_cols = df.select_dtypes(include=np.number).columns
-    for col in num_cols:
+    # remove outliers using IQR
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    for col in numeric_cols:
         Q1 = df[col].quantile(0.25)
         Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
@@ -57,11 +55,10 @@ def clean_data(df):
 
 
 # =========================
-# NOTEBOOK GENERATION
+# NOTEBOOK (NO EXECUTION)
 # =========================
 def build_notebook(csv_text):
     nb = new_notebook()
-
     cells = []
 
     cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
@@ -101,23 +98,14 @@ df.hist(figsize=(12,8))
 plt.show()
 """))
 
-    cells.append(new_markdown_cell("## Outliers (Boxplot)"))
+    cells.append(new_markdown_cell("## Outliers"))
     cells.append(new_code_cell("""
 df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
 plt.show()
 """))
 
-    nb['cells'] = cells
-    return nb
-
-
-# =========================
-# EXECUTE NOTEBOOK
-# =========================
-def execute_notebook(nb):
-    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
-    ep.preprocess(nb, {})
-    return nb
+    nb["cells"] = cells
+    return nbformat.writes(nb)
 
 
 # =========================
@@ -125,7 +113,11 @@ def execute_notebook(nb):
 # =========================
 @app.get("/")
 def home():
-    return {"status": "ok", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "service": "EDA Notebook API",
+        "version": "3.0.0"
+    }
 
 
 @app.post("/run")
@@ -137,22 +129,17 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
     content = await file.read()
     df = pd.read_csv(io.BytesIO(content))
 
-    # clean data
+    # clean
     df = clean_data(df)
 
-    # CSV to base64
+    # convert to csv
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     csv_text = csv_buffer.getvalue()
     csv_b64 = base64.b64encode(csv_text.encode()).decode()
 
     # notebook
-    nb = build_notebook(csv_text)
-
-    # EXECUTE notebook (IMPORTANT)
-    nb = execute_notebook(nb)
-
-    notebook_json = nbformat.writes(nb)
+    notebook_json = build_notebook(csv_text)
     notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
     return JSONResponse({
