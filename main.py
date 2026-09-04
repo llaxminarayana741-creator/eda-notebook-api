@@ -4,13 +4,8 @@ import os
 
 import pandas as pd
 import numpy as np
-import nbformat
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
-from nbformat.v4 import new_notebook, new_markdown_cell
 
 # =========================
 # CONFIG
@@ -21,128 +16,63 @@ app = FastAPI(title="EDA Notebook API", version="5.0.0")
 
 
 # =========================
-# AUTH (FIXED + DEBUG)
+# AUTH
 # =========================
 def verify_token(authorization: str = Header(None)):
-    print("===== AUTH DEBUG =====")
-    print("HEADER RECEIVED:", authorization)
-    print("EXPECTED API_KEY:", API_KEY)
-
-    if not authorization:
-        raise HTTPException(status_code=401, detail="No Authorization header")
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid format")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
 
     token = authorization.split(" ")[1]
-    print("TOKEN RECEIVED:", token)
-
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # =========================
-# DATA CLEANING
+# SAFE CLEANING (FIXED)
 # =========================
 def clean_data(df):
-    original_rows = len(df)
+    before_rows = len(df)
 
     # remove duplicates
     df = df.drop_duplicates()
 
-    # fill missing
-    df = df.ffill().bfill()
+    # fill missing values safely
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].fillna("Unknown")
+        else:
+            df[col] = df[col].fillna(df[col].median())
 
-    # safe numeric conversion
+    # convert numeric safely
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         except:
             pass
 
-    # remove outliers (max 5%)
+    # remove outliers safely (DO NOT DROP ALL DATA)
     numeric_cols = df.select_dtypes(include=np.number).columns
-    removed_rows = 0
 
     for col in numeric_cols:
         Q1 = df[col].quantile(0.25)
         Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
 
-        before = len(df)
-        df = df[(df[col] >= Q1 - 1.5 * IQR) & (df[col] <= Q3 + 1.5 * IQR)]
-        after = len(df)
+        if IQR == 0:
+            continue
 
-        removed_rows += (before - after)
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
 
-    print(f"Rows before: {original_rows}, after cleaning: {len(df)}")
+        # keep most data (limit removal)
+        mask = (df[col] >= lower) & (df[col] <= upper)
 
-    return df
+        if mask.sum() > 0.9 * len(df):  # keep 90% data
+            df = df[mask]
 
+    after_rows = len(df)
 
-# =========================
-# NOTEBOOK GENERATION
-# =========================
-def build_notebook(df):
-    nb = new_notebook()
-    cells = []
-
-    cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
-
-    # Preview
-    cells.append(new_markdown_cell("## Dataset Preview"))
-    cells.append(new_markdown_cell(df.head().to_html()))
-
-    # Info
-    buffer = io.StringIO()
-    df.info(buf=buffer)
-    cells.append(new_markdown_cell("## Dataset Info"))
-    cells.append(new_markdown_cell(f"```\n{buffer.getvalue()}\n```"))
-
-    # Describe
-    cells.append(new_markdown_cell("## Summary Statistics"))
-    cells.append(new_markdown_cell(df.describe(include='all').to_html()))
-
-    # Missing values
-    cells.append(new_markdown_cell("## Missing Values"))
-    cells.append(new_markdown_cell(df.isnull().sum().to_frame().to_html()))
-
-    # ================= GRAPHS =================
-
-    # Histogram
-    plt.figure(figsize=(10,6))
-    df.hist(figsize=(12,8))
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    img = base64.b64encode(buf.getvalue()).decode()
-    cells.append(new_markdown_cell("## Distribution"))
-    cells.append(new_markdown_cell(f"![Histogram](data:image/png;base64,{img})"))
-
-    # Boxplot
-    plt.figure(figsize=(10,6))
-    df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    img = base64.b64encode(buf.getvalue()).decode()
-    cells.append(new_markdown_cell("## Boxplots"))
-    cells.append(new_markdown_cell(f"![Boxplot](data:image/png;base64,{img})"))
-
-    # Heatmap
-    plt.figure(figsize=(10,6))
-    sns.heatmap(df.corr(numeric_only=True), annot=True, cmap='coolwarm')
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    img = base64.b64encode(buf.getvalue()).decode()
-    cells.append(new_markdown_cell("## Correlation Heatmap"))
-    cells.append(new_markdown_cell(f"![Heatmap](data:image/png;base64,{img})"))
-
-    nb["cells"] = cells
-    return nbformat.writes(nb)
+    return df, before_rows, after_rows
 
 
 # =========================
@@ -167,25 +97,77 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
 
     try:
         df = pd.read_csv(io.BytesIO(content))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"CSV read error: {e}")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
 
     if df.empty:
         raise HTTPException(status_code=400, detail="CSV is empty")
 
-    # clean
-    df = clean_data(df)
+    # CLEAN
+    df, before, after = clean_data(df)
 
-    # CSV output
+    if df.empty:
+        raise HTTPException(status_code=400, detail="All data removed during cleaning")
+
+    # =========================
+    # CREATE CLEAN CSV
+    # =========================
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     csv_b64 = base64.b64encode(csv_buffer.getvalue().encode()).decode()
 
-    # Notebook
-    notebook_json = build_notebook(df)
-    notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
+    # =========================
+    # GENERATE NOTEBOOK TEXT (ADVANCED)
+    # =========================
+    notebook_code = f"""
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set(style="whitegrid")
+
+df = pd.read_csv("cleaned_data.csv")
+
+print("Dataset Shape:", df.shape)
+
+# Preview
+df.head()
+
+# Info
+df.info()
+
+# Summary
+df.describe()
+
+# Missing values
+df.isnull().sum()
+
+# Histograms
+df.hist(figsize=(12,8))
+plt.show()
+
+# Boxplots
+df.plot(kind='box', subplots=True, layout=(4,4), figsize=(12,10))
+plt.show()
+
+# Correlation
+plt.figure(figsize=(10,6))
+sns.heatmap(df.corr(numeric_only=True), annot=True, cmap='coolwarm')
+plt.show()
+
+# Scatter plots
+numeric_cols = df.select_dtypes(include='number').columns
+
+if len(numeric_cols) >= 2:
+    sns.pairplot(df[numeric_cols[:5]])
+    plt.show()
+
+print("Data cleaned from", {before}, "to", {after}, "rows")
+"""
+
+    notebook_b64 = base64.b64encode(notebook_code.encode()).decode()
 
     return JSONResponse({
-        "csv_file": csv_b64,
-        "notebook_file": notebook_b64
+        "cleaned_csv": csv_b64,
+        "notebook_code": notebook_b64
     })
