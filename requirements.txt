@@ -1,4 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
+nbformat
+matplotlib
 python-multipart
