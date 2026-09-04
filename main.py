@@ -17,17 +17,26 @@ from nbformat.v4 import new_notebook, new_markdown_cell
 # =========================
 API_KEY = os.getenv("API_KEY", "mysecretkey")
 
-app = FastAPI(title="EDA Notebook API", version="4.0.0")
+app = FastAPI(title="EDA Notebook API", version="5.0.0")
 
 
 # =========================
-# AUTH
+# AUTH (FIXED + DEBUG)
 # =========================
 def verify_token(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    print("===== AUTH DEBUG =====")
+    print("HEADER RECEIVED:", authorization)
+    print("EXPECTED API_KEY:", API_KEY)
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail="No Authorization header")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid format")
 
     token = authorization.split(" ")[1]
+    print("TOKEN RECEIVED:", token)
+
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -36,29 +45,43 @@ def verify_token(authorization: str = Header(None)):
 # DATA CLEANING
 # =========================
 def clean_data(df):
+    original_rows = len(df)
+
+    # remove duplicates
     df = df.drop_duplicates()
+
+    # fill missing
     df = df.ffill().bfill()
 
-    # Safe numeric conversion
+    # safe numeric conversion
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         except:
             pass
 
-    # Remove outliers (IQR)
+    # remove outliers (max 5%)
     numeric_cols = df.select_dtypes(include=np.number).columns
+    removed_rows = 0
+
     for col in numeric_cols:
         Q1 = df[col].quantile(0.25)
         Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
+
+        before = len(df)
         df = df[(df[col] >= Q1 - 1.5 * IQR) & (df[col] <= Q3 + 1.5 * IQR)]
+        after = len(df)
+
+        removed_rows += (before - after)
+
+    print(f"Rows before: {original_rows}, after cleaning: {len(df)}")
 
     return df
 
 
 # =========================
-# NOTEBOOK WITH OUTPUTS
+# NOTEBOOK GENERATION
 # =========================
 def build_notebook(df):
     nb = new_notebook()
@@ -66,7 +89,7 @@ def build_notebook(df):
 
     cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
 
-    # Preview Table
+    # Preview
     cells.append(new_markdown_cell("## Dataset Preview"))
     cells.append(new_markdown_cell(df.head().to_html()))
 
@@ -84,6 +107,8 @@ def build_notebook(df):
     cells.append(new_markdown_cell("## Missing Values"))
     cells.append(new_markdown_cell(df.isnull().sum().to_frame().to_html()))
 
+    # ================= GRAPHS =================
+
     # Histogram
     plt.figure(figsize=(10,6))
     df.hist(figsize=(12,8))
@@ -92,8 +117,7 @@ def build_notebook(df):
     plt.savefig(buf, format="png")
     plt.close()
     img = base64.b64encode(buf.getvalue()).decode()
-
-    cells.append(new_markdown_cell("## Distribution Plots"))
+    cells.append(new_markdown_cell("## Distribution"))
     cells.append(new_markdown_cell(f"![Histogram](data:image/png;base64,{img})"))
 
     # Boxplot
@@ -104,18 +128,16 @@ def build_notebook(df):
     plt.savefig(buf, format="png")
     plt.close()
     img = base64.b64encode(buf.getvalue()).decode()
-
     cells.append(new_markdown_cell("## Boxplots"))
     cells.append(new_markdown_cell(f"![Boxplot](data:image/png;base64,{img})"))
 
-    # Correlation heatmap
+    # Heatmap
     plt.figure(figsize=(10,6))
     sns.heatmap(df.corr(numeric_only=True), annot=True, cmap='coolwarm')
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     plt.close()
     img = base64.b64encode(buf.getvalue()).decode()
-
     cells.append(new_markdown_cell("## Correlation Heatmap"))
     cells.append(new_markdown_cell(f"![Heatmap](data:image/png;base64,{img})"))
 
@@ -131,7 +153,7 @@ def home():
     return {
         "status": "ok",
         "service": "EDA Notebook API",
-        "version": "4.0.0"
+        "version": "5.0.0"
     }
 
 
@@ -151,16 +173,15 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
     if df.empty:
         raise HTTPException(status_code=400, detail="CSV is empty")
 
-    # Clean data
+    # clean
     df = clean_data(df)
 
     # CSV output
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
-    csv_text = csv_buffer.getvalue()
-    csv_b64 = base64.b64encode(csv_text.encode()).decode()
+    csv_b64 = base64.b64encode(csv_buffer.getvalue().encode()).decode()
 
-    # Notebook output
+    # Notebook
     notebook_json = build_notebook(df)
     notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
