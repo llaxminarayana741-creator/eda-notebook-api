@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 pandas
+numpy
 nbformat
 matplotlib
+seaborn
 python-multipart
