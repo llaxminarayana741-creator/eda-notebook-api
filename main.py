@@ -18,7 +18,6 @@ from nbclient import NotebookClient
 # =========================
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
-    # Fail loudly at startup instead of silently accepting a hardcoded default.
     raise RuntimeError("API_KEY environment variable is not set on this deployment.")
 
 MAX_FILE_SIZE_MB = 15
@@ -56,19 +55,16 @@ def clean_data(df: pd.DataFrame):
     numeric_cols = df.select_dtypes(include=np.number).columns
     categorical_cols = df.select_dtypes(exclude=np.number).columns
 
-    # Numeric: median fill
     for col in numeric_cols:
         if df[col].isnull().any():
             df[col] = df[col].fillna(df[col].median())
 
-    # Categorical: mode fill (guard against an all-null column)
     for col in categorical_cols:
         if df[col].isnull().any():
             mode = df[col].mode(dropna=True)
             fill_value = mode.iloc[0] if not mode.empty else "Unknown"
             df[col] = df[col].fillna(fill_value)
 
-    # IQR-based outlier capping (not dropping) for numeric columns
     for col in numeric_cols:
         q1 = df[col].quantile(0.25)
         q3 = df[col].quantile(0.75)
@@ -92,8 +88,6 @@ def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
 
     cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
 
-    # Load data from base64 instead of embedding raw CSV text as a Python
-    # string literal (which breaks on quotes/backslashes in the data).
     cells.append(new_code_cell(
         "import base64, io\n"
         "import pandas as pd\n"
@@ -139,8 +133,6 @@ def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
         "    print(df[col].value_counts())"
     ))
 
-    # Dynamic subplot grid instead of a hardcoded (4,4) layout — this was
-    # the direct cause of the 500 errors on datasets with >16 or 0 numeric cols.
     cells.append(new_markdown_cell("## Histograms"))
     cells.append(new_code_cell(
         "if len(num_cols) > 0:\n"
@@ -195,8 +187,6 @@ def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
 
     nb["cells"] = cells
 
-    # Actually execute the notebook server-side so graphs/tables are baked
-    # into the delivered .ipynb, instead of shipping unexecuted source cells.
     client = NotebookClient(nb, timeout=120, kernel_name="python3")
     client.execute()
 
