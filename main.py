@@ -159,7 +159,8 @@ async def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
 
     # ---- Load Dataset ----
     cells.append(new_markdown_cell("Load Dataset"))
-    cells.append(new_code_cell(
+    load_cell = new_code_cell(
+        "#@title Load Dataset (click to view code) { display-mode: \"form\" }\n"
         "import base64, io\n"
         "import pandas as pd\n"
         "import numpy as np\n"
@@ -168,7 +169,13 @@ async def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
         f'csv_b64 = "{csv_b64}"\n'
         "df = pd.read_csv(io.StringIO(base64.b64decode(csv_b64).decode('utf-8')))\n\n"
         "df.head()"
-    ))
+    )
+    # Collapse this cell's source by default: Colab respects "cellView": "form"
+    # (shows a "Show code" toggle instead of the raw text), and JupyterLab/
+    # Notebook 7 respect metadata.jupyter.source_hidden for the same effect.
+    load_cell["metadata"]["cellView"] = "form"
+    load_cell["metadata"]["jupyter"] = {"source_hidden": True}
+    cells.append(load_cell)
 
     # ---- dataset dimensions ----
     cells.append(new_markdown_cell("dataset dimensions (rows columns)"))
