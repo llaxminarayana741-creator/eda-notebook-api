@@ -18,6 +18,7 @@ from nbclient import NotebookClient
 # =========================
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
+    # Fail loudly at startup instead of silently accepting a hardcoded default.
     raise RuntimeError("API_KEY environment variable is not set on this deployment.")
 
 MAX_FILE_SIZE_MB = 15
@@ -55,16 +56,19 @@ def clean_data(df: pd.DataFrame):
     numeric_cols = df.select_dtypes(include=np.number).columns
     categorical_cols = df.select_dtypes(exclude=np.number).columns
 
+    # Numeric: median fill
     for col in numeric_cols:
         if df[col].isnull().any():
             df[col] = df[col].fillna(df[col].median())
 
+    # Categorical: mode fill (guard against an all-null column)
     for col in categorical_cols:
         if df[col].isnull().any():
             mode = df[col].mode(dropna=True)
             fill_value = mode.iloc[0] if not mode.empty else "Unknown"
             df[col] = df[col].fillna(fill_value)
 
+    # IQR-based outlier capping (not dropping) for numeric columns
     for col in numeric_cols:
         q1 = df[col].quantile(0.25)
         q3 = df[col].quantile(0.75)
@@ -82,12 +86,79 @@ def clean_data(df: pd.DataFrame):
 # =========================
 # NOTEBOOK BUILDER
 # =========================
+def _pick_columns(df: pd.DataFrame):
+    """
+    Auto-detect which columns drive the template, so the same notebook
+    structure works on any uploaded CSV instead of hardcoded column names
+    like "Churn" / "Contract" / "MonthlyCharges".
+    """
+    numeric_cols = list(df.select_dtypes(include=np.number).columns)
+    categorical_cols = list(df.select_dtypes(include="object").columns)
+
+    # Exclude ID-like numeric columns (e.g. "customerID" stored as an int,
+    # or a fully-unique row index) from being picked as an analysis column —
+    # they're identifiers, not measurements, and would produce meaningless
+    # "average by group" charts.
+    def _looks_like_id(col):
+        name = col.lower()
+        if "id" in name or name in ("index", "unnamed: 0"):
+            return True
+        # Only flag as an index column if it's a perfectly sequential integer
+        # run (e.g. 0..n-1 or 1..n) — a real measurement (like TotalCharges)
+        # can also be all-unique but isn't sequential, so it's kept.
+        series = df[col]
+        if pd.api.types.is_integer_dtype(series) and series.nunique() == len(series):
+            sorted_vals = series.sort_values().to_numpy()
+            if len(sorted_vals) > 1 and (sorted_vals[1:] - sorted_vals[:-1] == 1).all():
+                return True
+        return False
+
+    numeric_cols = [c for c in numeric_cols if not _looks_like_id(c)]
+
+    # Target: prefer a binary categorical column (like "Churn"), else the
+    # last categorical column with a reasonable number of categories.
+    target_col = None
+    for c in categorical_cols:
+        if df[c].nunique() == 2:
+            target_col = c
+            break
+    if target_col is None:
+        for c in reversed(categorical_cols):
+            if 2 <= df[c].nunique() <= 15:
+                target_col = c
+                break
+
+    # A second grouping column (like "Contract"), distinct from the target,
+    # with a manageable number of categories for count plots / crosstabs.
+    group_col = None
+    for c in categorical_cols:
+        if c != target_col and 2 <= df[c].nunique() <= 15:
+            group_col = c
+            break
+
+    primary_num = numeric_cols[0] if len(numeric_cols) > 0 else None
+    secondary_num = numeric_cols[1] if len(numeric_cols) > 1 else None
+
+    return {
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "target_col": target_col,
+        "group_col": group_col,
+        "primary_num": primary_num,
+        "secondary_num": secondary_num,
+    }
+
+
 async def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
+    cols = _pick_columns(df)
+    num1, num2 = cols["primary_num"], cols["secondary_num"]
+    target, group = cols["target_col"], cols["group_col"]
+
     nb = new_notebook()
     cells = []
 
-    cells.append(new_markdown_cell("# 📊 Automated EDA Report"))
-
+    # ---- Load Dataset ----
+    cells.append(new_markdown_cell("Load Dataset"))
     cells.append(new_code_cell(
         "import base64, io\n"
         "import pandas as pd\n"
@@ -95,99 +166,251 @@ async def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
         "import matplotlib.pyplot as plt\n"
         "import seaborn as sns\n\n"
         f'csv_b64 = "{csv_b64}"\n'
-        "df = pd.read_csv(io.StringIO(base64.b64decode(csv_b64).decode('utf-8')))\n"
+        "df = pd.read_csv(io.StringIO(base64.b64decode(csv_b64).decode('utf-8')))\n\n"
         "df.head()"
     ))
 
-    cells.append(new_markdown_cell("## Dataset Overview"))
-    cells.append(new_code_cell('print("Shape:", df.shape)\nprint("Columns:", df.columns.tolist())'))
+    # ---- dataset dimensions ----
+    cells.append(new_markdown_cell("dataset dimensions (rows columns)"))
+    cells.append(new_code_cell("df.shape\ndf.columns"))
 
-    cells.append(new_markdown_cell("## Dataset Info"))
-    cells.append(new_code_cell("df.info()"))
-
-    cells.append(new_markdown_cell("## Summary Statistics"))
-    cells.append(new_code_cell("df.describe(include='all')"))
-
-    cells.append(new_markdown_cell("## Missing Values"))
+    # ---- dataset information ----
+    cells.append(new_markdown_cell("dataset information"))
     cells.append(new_code_cell(
-        "missing = df.isnull().sum()\n"
-        "percent = (missing / len(df)) * 100\n"
-        'pd.DataFrame({"Missing": missing, "Percent": percent})'
+        "df.info()\n"
+        "df.dtypes\n"
+        "df.describe()\n"
+        "df.describe(include=\"object\")\n"
+        "df.nunique()"
     ))
 
-    cells.append(new_markdown_cell("## Duplicate Rows"))
-    cells.append(new_code_cell('print("Duplicate rows:", df.duplicated().sum())\ndf[df.duplicated()]'))
+    # ---- Missing values ----
+    cells.append(new_markdown_cell("Missing values"))
+    cells.append(new_code_cell("df.isnull().sum()"))
+    cells.append(new_code_cell("(df.isnull().sum() / len(df)) * 100"))
 
-    cells.append(new_markdown_cell("## Column Types"))
+    # ---- Duplicate rows ----
+    cells.append(new_markdown_cell("Duplicate rows"))
+    cells.append(new_code_cell("df.duplicated().sum()\ndf[df.duplicated()]"))
+
+    # ---- numerical and categorical columns ----
+    cells.append(new_markdown_cell("numerical and categorical columns"))
     cells.append(new_code_cell(
-        "num_cols = df.select_dtypes(include=np.number).columns\n"
-        "cat_cols = df.select_dtypes(exclude=np.number).columns\n"
-        'print("Numerical Columns:", list(num_cols))\n'
-        'print("Categorical Columns:", list(cat_cols))'
+        "numerical_columns = df.select_dtypes(include=np.number).columns\n"
+        "categorical_columns = df.select_dtypes(include=\"object\").columns\n\n"
+        "print(\"Numerical Columns:\")\n"
+        "print(numerical_columns)\n\n"
+        "print(\"\\nCategorical Columns:\")\n"
+        "print(categorical_columns)"
     ))
 
-    cells.append(new_markdown_cell("## Categorical Value Counts"))
     cells.append(new_code_cell(
-        "for col in cat_cols:\n"
-        '    print(f"\\nColumn: {col}")\n'
-        "    print(df[col].value_counts())"
+        "for column in categorical_columns:\n"
+        "    print(column)\n"
+        "    print(df[column].unique())\n"
+        "    print()"
     ))
 
-    cells.append(new_markdown_cell("## Histograms"))
     cells.append(new_code_cell(
-        "if len(num_cols) > 0:\n"
-        "    df[num_cols].hist(figsize=(12, 3 * ((len(num_cols) - 1) // 3 + 1)))\n"
-        "    plt.tight_layout()\n"
-        "    plt.show()\n"
-        "else:\n"
-        "    print('No numeric columns to plot.')"
+        "for column in categorical_columns:\n"
+        "    print(df[column].value_counts())\n"
+        "    print()"
     ))
 
-    cells.append(new_markdown_cell("## Boxplots"))
+    # ---- Histograms / Distogram / Box plots (primary numeric column) ----
+    if num1:
+        cells.append(new_markdown_cell("Histograms"))
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(8, 5))\n'
+            f'plt.hist(df["{num1}"], bins=30, edgecolor="black")\n\n'
+            f'plt.xlabel("{num1}")\n'
+            f'plt.ylabel("Frequency")\n'
+            f'plt.title("Distribution of {num1}")\n\n'
+            f'plt.show()'
+        ))
+
+        cells.append(new_markdown_cell("Distogram"))
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(8, 5))\n\n'
+            f'sns.histplot(df["{num1}"], kde=True)\n\n'
+            f'plt.title("Distribution of {num1}")\n'
+            f'plt.show()'
+        ))
+
+        cells.append(new_markdown_cell("Box plots"))
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(8, 4))\n\n'
+            f'sns.boxplot(x=df["{num1}"])\n\n'
+            f'plt.title("Box Plot of {num1}")\n'
+            f'plt.show()'
+        ))
+
+    # ---- Count plot (target + group column) ----
+    if target or group:
+        cells.append(new_markdown_cell("Count plot"))
+        code = ""
+        if target:
+            code += (
+                f'plt.figure(figsize=(6, 4))\n\n'
+                f'sns.countplot(x="{target}", data=df)\n\n'
+                f'plt.title("{target} Distribution")\n'
+                f'plt.show()\n\n'
+            )
+        if group:
+            code += (
+                f'plt.figure(figsize=(8, 5))\n\n'
+                f'sns.countplot(x="{group}", data=df)\n\n'
+                f'plt.title("Customers by {group}")\n'
+                f'plt.show()'
+            )
+        cells.append(new_code_cell(code.strip()))
+
+    # ---- Pie chart (target column) ----
+    if target:
+        cells.append(new_markdown_cell("Pie chart"))
+        cells.append(new_code_cell(
+            f'df["{target}"].value_counts().plot(\n'
+            f'    kind="pie",\n'
+            f'    autopct="%1.1f%%",\n'
+            f'    figsize=(6, 6)\n'
+            f')\n\n'
+            f'plt.title("{target} Percentage")\n'
+            f'plt.ylabel("")\n'
+            f'plt.show()'
+        ))
+
+    # ---- Bivariate analysis ----
+    cells.append(new_markdown_cell("Bivariate analysis"))
+    if num1 and num2:
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(8, 5))\n\n'
+            f'plt.scatter(df["{num1}"], df["{num2}"], alpha=0.5)\n\n'
+            f'plt.xlabel("{num1}")\n'
+            f'plt.ylabel("{num2}")\n'
+            f'plt.title("{num1} vs {num2}")\n\n'
+            f'plt.show()'
+        ))
+    if target and num1:
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(8, 5))\n\n'
+            f'sns.boxplot(x="{target}", y="{num1}", data=df)\n\n'
+            f'plt.title("{num1} by {target}")\n'
+            f'plt.show()'
+        ))
+    if group and target:
+        cells.append(new_code_cell(
+            f'plt.figure(figsize=(9, 5))\n\n'
+            f'sns.countplot(x="{group}", hue="{target}", data=df)\n\n'
+            f'plt.title("{group} vs {target}")\n'
+            f'plt.show()'
+        ))
+        cells.append(new_code_cell(f'pd.crosstab(df["{group}"], df["{target}"])'))
+        cells.append(new_code_cell(
+            f'pd.crosstab(\n'
+            f'    df["{group}"],\n'
+            f'    df["{target}"],\n'
+            f'    normalize="index"\n'
+            f') * 100'
+        ))
+
+    # ---- Group based analysis ----
+    if group and num1:
+        cells.append(new_markdown_cell("Grp based analysis"))
+        cells.append(new_code_cell(f'df.groupby("{group}")["{num1}"].mean()'))
+        cells.append(new_code_cell(
+            f'df.groupby("{group}")["{num1}"].mean().plot(\n'
+            f'    kind="bar",\n'
+            f'    figsize=(8, 5)\n'
+            f')\n\n'
+            f'plt.ylabel("Average {num1}")\n'
+            f'plt.title("Average {num1} by {group}")\n'
+            f'plt.show()'
+        ))
+
+    # ---- Average <numeric> by <target> ----
+    if target and num1:
+        cells.append(new_markdown_cell(f"Average {num1} by {target}"))
+        cells.append(new_code_cell(f'df.groupby("{target}")["{num1}"].mean()'))
+        cells.append(new_code_cell(
+            f'df.groupby("{target}")["{num1}"].mean().plot(\n'
+            f'    kind="bar",\n'
+            f'    figsize=(6, 4)\n'
+            f')\n\n'
+            f'plt.ylabel("Average {num1}")\n'
+            f'plt.title("Average {num1} by {target}")\n'
+            f'plt.show()'
+        ))
+
+    # ---- Multivariate analysis ----
+    cells.append(new_markdown_cell("Multivariate analysis"))
     cells.append(new_code_cell(
-        "if len(num_cols) > 0:\n"
-        "    n = len(num_cols)\n"
-        "    cols = 3\n"
-        "    rows = (n - 1) // cols + 1\n"
-        "    df[num_cols].plot(kind='box', subplots=True, layout=(rows, cols), figsize=(12, 3 * rows))\n"
-        "    plt.tight_layout()\n"
-        "    plt.show()\n"
-        "else:\n"
-        "    print('No numeric columns to plot.')"
+        "numeric_df = df.select_dtypes(include=np.number)\n\n"
+        "correlation = numeric_df.corr()\n\n"
+        "correlation"
+    ))
+    cells.append(new_code_cell(
+        "plt.figure(figsize=(10, 6))\n\n"
+        "sns.heatmap(\n"
+        "    correlation,\n"
+        "    annot=True,\n"
+        "    cmap=\"coolwarm\",\n"
+        "    fmt=\".2f\"\n"
+        ")\n\n"
+        "plt.title(\"Correlation Heatmap\")\n"
+        "plt.show()"
     ))
 
-    cells.append(new_markdown_cell("## Correlation Heatmap"))
+    # ---- Pair plot ----
+    if len(cols["numeric_cols"]) >= 2:
+        cells.append(new_markdown_cell("Pair plot"))
+        num_list = cols["numeric_cols"][:4]
+        num_list_str = ", ".join(f'"{c}"' for c in num_list)
+        cells.append(new_code_cell(
+            f"sns.pairplot(\n"
+            f"    df[[{num_list_str}]].dropna()\n"
+            f")\n\n"
+            f"plt.show()"
+        ))
+        if target:
+            with_target_str = ", ".join(f'"{c}"' for c in num_list + [target])
+            cells.append(new_code_cell(
+                f"sns.pairplot(\n"
+                f"    df[[{with_target_str}]].dropna(),\n"
+                f'    hue="{target}"\n'
+                f")\n\n"
+                f"plt.show()"
+            ))
+
+    # ---- Missing Values Visualization ----
+    cells.append(new_markdown_cell("Missing Values Visualization"))
     cells.append(new_code_cell(
-        "if len(num_cols) > 1:\n"
-        "    plt.figure(figsize=(10, 6))\n"
-        "    sns.heatmap(df[num_cols].corr(), annot=True, cmap='coolwarm')\n"
-        "    plt.show()\n"
-        "else:\n"
-        "    print('Not enough numeric columns for a correlation heatmap.')"
+        "plt.figure(figsize=(12, 5))\n\n"
+        "df.isnull().sum().plot(kind=\"bar\")\n\n"
+        "plt.xlabel(\"Columns\")\n"
+        "plt.ylabel(\"Missing Values\")\n"
+        "plt.title(\"Missing Values in Dataset\")\n\n"
+        "plt.show()"
+    ))
+    cells.append(new_code_cell(
+        "missing_percentage = df.isnull().mean() * 100\n\n"
+        "missing_percentage[missing_percentage > 0]"
     ))
 
-    cells.append(new_markdown_cell("## Scatter Plots (Top Correlated Pairs)"))
-    cells.append(new_code_cell(
-        "if len(num_cols) >= 2:\n"
-        "    corr = df[num_cols].corr().abs()\n"
-        "    pairs = (\n"
-        "        corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))\n"
-        "        .stack()\n"
-        "        .sort_values(ascending=False)\n"
-        "        .head(3)\n"
-        "    )\n"
-        "    for (a, b), _ in pairs.items():\n"
-        "        plt.figure(figsize=(6, 4))\n"
-        "        sns.scatterplot(x=df[a], y=df[b])\n"
-        "        plt.title(f'{a} vs {b}')\n"
-        "        plt.show()\n"
-        "else:\n"
-        "    print('Not enough numeric columns for scatter plots.')"
-    ))
+    # ---- Target variable analysis ----
+    if target:
+        cells.append(new_markdown_cell("Target variable analysis"))
+        cells.append(new_code_cell(f'df["{target}"].value_counts()'))
+        cells.append(new_code_cell(f'df["{target}"].value_counts(normalize=True) * 100'))
 
     nb["cells"] = cells
 
-    client = NotebookClient(nb, timeout=120, kernel_name="python3")
+    # Actually execute the notebook server-side so graphs/tables are baked
+    # into the delivered .ipynb, instead of shipping unexecuted source cells.
+    # Uses async_execute() (not the sync execute()) because this function is
+    # awaited from inside an async FastAPI route — the sync version tries to
+    # spawn its own event loop + signal handlers on a non-main thread and
+    # crashes with "add_signal_handler() can only be called from the main thread".
+    client = NotebookClient(nb, timeout=180, kernel_name="python3")
     await client.async_execute()
 
     return nbformat.writes(nb)
