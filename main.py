@@ -82,7 +82,7 @@ def clean_data(df: pd.DataFrame):
 # =========================
 # NOTEBOOK BUILDER
 # =========================
-def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
+async def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
     nb = new_notebook()
     cells = []
 
@@ -188,7 +188,7 @@ def build_notebook(df: pd.DataFrame, csv_b64: str) -> str:
     nb["cells"] = cells
 
     client = NotebookClient(nb, timeout=120, kernel_name="python3")
-    client.execute()
+    await client.async_execute()
 
     return nbformat.writes(nb)
 
@@ -226,7 +226,7 @@ async def run(file: UploadFile = File(...), _: None = Depends(verify_token)):
         df.to_csv(csv_buffer, index=False)
         csv_b64 = base64.b64encode(csv_buffer.getvalue().encode()).decode()
 
-        notebook_json = build_notebook(df, csv_b64)
+        notebook_json = await build_notebook(df, csv_b64)
         notebook_b64 = base64.b64encode(notebook_json.encode()).decode()
 
         return JSONResponse({
